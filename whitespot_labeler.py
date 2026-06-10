@@ -6,15 +6,18 @@ import tempfile
 import tkinter as tk
 from datetime import datetime
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
+from statistics import median
 from tkinter import filedialog, messagebox, ttk
 from xml.sax.saxutils import escape
 from zipfile import BadZipFile, ZIP_DEFLATED, ZipFile
 
 try:
-    from PIL import Image, ImageTk
+    from PIL import Image, ImageDraw, ImageTk  # pyright: ignore[reportMissingImports]
 except ImportError:
     Image = None
+    ImageDraw = None
     ImageTk = None
 
 
@@ -58,8 +61,8 @@ class WhiteSpotLabeler(tk.Tk):
     def __init__(self, default_zip=None):
         super().__init__()
         self.title("Dryness Image Labeler")
-        self.geometry("1100x780")
-        self.minsize(780, 560)
+        self.geometry("1600x1100")
+        self.minsize(1100, 800)
         self.configure(bg=THEME["bg"])
 
         self.zip_path = Path(default_zip).expanduser() if default_zip else None
@@ -69,10 +72,15 @@ class WhiteSpotLabeler(tk.Tk):
         self.index = 0
         self.annotations = {}
         self.current_photo = None
+        self.zoom_factor = 1.0
+        self.zoom_step = 1.25
+        self.min_zoom = 0.5
+        self.max_zoom = 4.0
         self.progress_var = tk.DoubleVar(value=0)
         self.temp_dir = tempfile.TemporaryDirectory(prefix="whitespot_labeler_")
 
         self._build_ui()
+        self.after(0, self._maximize_window)
         if self.zip_path and self.zip_path.exists():
             self._load_zip(self.zip_path)
 
@@ -88,26 +96,13 @@ class WhiteSpotLabeler(tk.Tk):
 
         header = ttk.Frame(root, style="App.TFrame")
         header.grid(row=0, column=0, sticky="ew")
-        header.columnconfigure(0, weight= 1)
+        header.columnconfigure(0, weight=1)
         header.columnconfigure(1, weight=0)
         ttk.Label(header, text="Dryness Image Labeler", style="Title.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Button(header, text="Help", command=self._show_help).grid(row=0, column=1, sticky="e")
-        ttk.Label(
-            header,
-            text="A simple guided tool for labeling image dryness and saving the results to CSV and Excel.",
-            style="MutedOnBg.TLabel",
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 0))
-
-        steps = ttk.Frame(header, style="App.TFrame")
-        steps.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(12, 0))
-        for col, text in enumerate(("1. Choose ZIP", "2. Pick dataset", "3. Label images", "4. Open CSV/Excel")):
-            steps.columnconfigure(col, weight=1)
-            ttk.Label(steps, text=text, anchor="center", style="Step.TLabel").grid(
-                row=0, column=col, sticky="ew", padx=(0 if col == 0 else 6, 0)
-            )
 
         file_bar = ttk.Frame(header, style="App.TFrame")
-        file_bar.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        file_bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(14, 0))
         file_bar.columnconfigure(1, weight=1)
         ttk.Button(file_bar, text="Choose Image ZIP File", command=self._choose_zip, style="Accent.TButton").grid(
             row=0, column=0, padx=(0, 10)
@@ -186,13 +181,16 @@ class WhiteSpotLabeler(tk.Tk):
         self.count_label = ttk.Label(progress_row, text="", style="MutedOnPanel.TLabel", anchor="e")
         self.count_label.grid(row=0, column=1, padx=(12, 0))
 
-        self.question_label = ttk.Label(
-            labeler,
-            text="Look at the image, then choose the button that best matches the dryness level.",
-            anchor="center",
-            style="Question.TLabel",
+        zoom_row = ttk.Frame(labeler, style="Panel.TFrame")
+        zoom_row.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        zoom_row.columnconfigure(1, weight=1)
+        ttk.Button(zoom_row, text="Zoom Out", command=lambda: self._change_zoom(1 / self.zoom_step)).grid(
+            row=0, column=0, padx=(0, 8)
         )
-        self.question_label.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        self.zoom_label = ttk.Label(zoom_row, text="", style="MutedOnPanel.TLabel", anchor="w")
+        self.zoom_label.grid(row=0, column=1, sticky="w")
+        ttk.Button(zoom_row, text="Reset Zoom", command=self._reset_zoom).grid(row=0, column=2, padx=8)
+        ttk.Button(zoom_row, text="Zoom In", command=lambda: self._change_zoom(self.zoom_step)).grid(row=0, column=3)
 
         image_shell = tk.Frame(labeler, bg=THEME["stage"], highlightthickness=1, highlightbackground=THEME["line"])
         image_shell.grid(row=3, column=0, sticky="nsew")
@@ -205,8 +203,11 @@ class WhiteSpotLabeler(tk.Tk):
         self.path_label = ttk.Label(labeler, text="", anchor="center", style="Path.TLabel")
         self.path_label.grid(row=4, column=0, sticky="ew", pady=(10, 0))
 
+        self.analysis_label = ttk.Label(labeler, text="", anchor="center", style="MutedOnPanel.TLabel")
+        self.analysis_label.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+
         buttons = ttk.Frame(labeler, style="Panel.TFrame")
-        buttons.grid(row=5, column=0, sticky="ew", pady=(14, 0))
+        buttons.grid(row=6, column=0, sticky="ew", pady=(14, 0))
         for col, (key, label, helper, color_key) in enumerate(LABEL_CHOICES):
             buttons.columnconfigure(col, weight=1)
             button = tk.Button(
@@ -228,7 +229,7 @@ class WhiteSpotLabeler(tk.Tk):
             button.grid(row=0, column=col, sticky="ew", padx=4)
 
         keys = ttk.Frame(labeler, style="Panel.TFrame")
-        keys.grid(row=6, column=0, sticky="ew", pady=(10, 0))
+        keys.grid(row=7, column=0, sticky="ew", pady=(10, 0))
         keys.columnconfigure(1, weight=1)
         ttk.Button(keys, text="Previous Image", command=self._previous_image).grid(row=0, column=0)
         ttk.Label(
@@ -243,6 +244,14 @@ class WhiteSpotLabeler(tk.Tk):
             self.bind(key, lambda _event, value=label: self._label_current(value))
         self.bind("<Left>", lambda _event: self._previous_image())
         self.bind("<Right>", lambda _event: self._next_image())
+        self.bind_all("<Control-MouseWheel>", self._on_zoom_wheel)
+        self.bind_all("<Control-Button-4>", self._on_zoom_wheel)
+        self.bind_all("<Control-Button-5>", self._on_zoom_wheel)
+        self.bind("<Control-minus>", lambda _event: self._change_zoom(1 / self.zoom_step))
+        self.bind("<Control-equal>", lambda _event: self._change_zoom(self.zoom_step))
+        self.bind("<Control-plus>", lambda _event: self._change_zoom(self.zoom_step))
+        self.bind("<Control-0>", lambda _event: self._reset_zoom())
+        self._update_zoom_label()
 
     def _configure_styles(self):
         style = ttk.Style(self)
@@ -259,13 +268,6 @@ class WhiteSpotLabeler(tk.Tk):
         style.configure("MutedOnBg.TLabel", background=THEME["bg"], foreground=THEME["muted"], font=("Segoe UI", 10))
         style.configure("MutedOnPanel.TLabel", background=THEME["panel"], foreground=THEME["muted"], font=("Segoe UI", 10))
         style.configure("Path.TLabel", background=THEME["panel"], foreground=THEME["muted"], font=("Segoe UI", 9))
-        style.configure(
-            "Step.TLabel",
-            background="#e7eeed",
-            foreground=THEME["ink"],
-            padding=(8, 7),
-            font=("Segoe UI", 9, "bold"),
-        )
         style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"))
         style.configure(
             "Horizontal.TProgressbar",
@@ -274,13 +276,20 @@ class WhiteSpotLabeler(tk.Tk):
             bordercolor="#e7eeed",
         )
 
+    def _maximize_window(self):
+        try:
+            self.state("zoomed")
+        except tk.TclError:
+            pass
+
     def _show_help(self):
         messagebox.showinfo(
             "How to use Dryness Image Labeler",
             "1. Click Choose Image ZIP File.\n"
             "2. Select the dataset you want to label.\n"
             "3. Click Start Labeling Selected Dataset.\n"
-            "4. For each image, choose the button that best describes the dryness level.\n\n"
+            "4. Use Zoom In, Zoom Out, Ctrl +/- or Ctrl + mouse wheel to inspect details.\n"
+            "5. For each image, choose the button that best describes the dryness level.\n\n"
             "The app saves after every label. Your CSV and Excel files are saved beside the ZIP file.",
         )
 
@@ -422,15 +431,56 @@ class WhiteSpotLabeler(tk.Tk):
         self.labeler_frame.grid_remove()
         self.picker_frame.grid()
 
+    def _update_zoom_label(self):
+        if hasattr(self, "zoom_label"):
+            self.zoom_label.config(text=f"Zoom: {round(self.zoom_factor * 100):.0f}%")
+
+    def _change_zoom(self, factor):
+        next_zoom = self.zoom_factor * factor
+        self.zoom_factor = max(self.min_zoom, min(self.max_zoom, next_zoom))
+        self._update_zoom_label()
+        if self.items and self.zip_file:
+            self._show_current_image()
+
+    def _reset_zoom(self):
+        self.zoom_factor = 1.0
+        self._update_zoom_label()
+        if self.items and self.zip_file:
+            self._show_current_image()
+
+    def _on_zoom_wheel(self, event):
+        delta = getattr(event, "delta", 0)
+        number = getattr(event, "num", None)
+        if delta > 0 or number == 4:
+            self._change_zoom(self.zoom_step)
+        elif delta < 0 or number == 5:
+            self._change_zoom(1 / self.zoom_step)
+
+    def _display_dimensions(self, data, max_width, max_height):
+        if not Image:
+            return max_width, max_height
+
+        with Image.open(io.BytesIO(data)) as image:
+            original_width, original_height = image.size
+
+        base_scale = min(max_width / original_width, max_height / original_height)
+        scale = max(base_scale * self.zoom_factor, 0.01)
+        return max(1, int(original_width * scale)), max(1, int(original_height * scale))
+
     def _show_current_image(self):
         if not self.items or not self.zip_file:
             return
         item = self.items[self.index]
+        width = max(self.image_label.winfo_width() - 20, 200)
+        height = max(self.image_label.winfo_height() - 20, 200)
         try:
             data = self.zip_file.read(item.archive_path)
-            self.current_photo = self._make_photo(data)
+            display_width, display_height = self._display_dimensions(data, width, height)
+            analysis = self._analyze_white_spots(data, display_width, display_height)
+            self.current_photo = self._make_photo(data, display_width, display_height, analysis)
         except Exception as exc:
             self.current_photo = None
+            self.analysis_label.config(text="")
             self.image_label.config(text=f"Could not load image:\n{exc}", image="")
             return
 
@@ -443,23 +493,157 @@ class WhiteSpotLabeler(tk.Tk):
         self.progress_var.set(percent)
         self.count_label.config(text=f"{label_text} | {labeled}/{len(self.items)} saved")
         self.path_label.config(text=item.archive_path)
+        if analysis:
+            self.analysis_label.config(text=analysis["summary"])
+        else:
+            self.analysis_label.config(text="")
+        self._update_zoom_label()
 
-    def _make_photo(self, data):
-        width = max(self.image_label.winfo_width() - 20, 200)
-        height = max(self.image_label.winfo_height() - 20, 200)
+    def _make_photo(self, data, width, height, analysis=None):
 
         if Image and ImageTk:
-            image = Image.open(io.BytesIO(data))
-            image.thumbnail((width, height), Image.Resampling.LANCZOS)
+            image = Image.open(io.BytesIO(data)).convert("RGB")
+            image = image.resize((width, height), Image.Resampling.LANCZOS)
+            if analysis and analysis.get("boxes") and ImageDraw:
+                draw = ImageDraw.Draw(image)
+                outline_width = max(2, min(image.size) // 100)
+                for box in analysis["boxes"]:
+                    draw.rectangle(box, outline=(255, 215, 0), width=outline_width)
             return ImageTk.PhotoImage(image)
 
         suffix = ".png"
         temp_path = Path(self.temp_dir.name) / f"current{suffix}"
         temp_path.write_bytes(data)
         photo = tk.PhotoImage(file=str(temp_path))
-        while photo.width() > width or photo.height() > height:
-            photo = photo.subsample(2, 2)
+        base_scale = min(width / max(photo.width(), 1), height / max(photo.height(), 1))
+        scale = max(base_scale * self.zoom_factor, 0.01)
+        ratio = Fraction(scale).limit_denominator(20)
+        photo = photo.zoom(ratio.numerator, ratio.numerator).subsample(ratio.denominator, ratio.denominator)
         return photo
+
+    def _analyze_white_spots(self, data, width, height):
+        if not Image:
+            return None
+
+        image = Image.open(io.BytesIO(data)).convert("RGB")
+        image = image.resize((width, height), Image.Resampling.LANCZOS)
+        pixels = list(image.getdata())
+        if not pixels:
+            return None
+
+        luminance = [int((r * 0.299) + (g * 0.587) + (b * 0.114)) for r, g, b in pixels]
+        histogram = [0] * 256
+        for value in luminance:
+            histogram[value] += 1
+
+        threshold = self._otsu_threshold(histogram)
+        foreground_mask = [value > threshold for value in luminance]
+        foreground_values = [value for value, is_foreground in zip(luminance, foreground_mask) if is_foreground]
+        if not foreground_values:
+            return None
+
+        foreground_median = median(foreground_values)
+        brightness_cutoff = min(245, max(threshold + 28, int(foreground_median + 20)))
+        min_component_area = max(8, int((width * height) * 0.00015))
+
+        candidate_mask = []
+        for (red, green, blue), value, is_foreground in zip(pixels, luminance, foreground_mask):
+            if not is_foreground:
+                candidate_mask.append(False)
+                continue
+
+            chroma = max(red, green, blue) - min(red, green, blue)
+            candidate_mask.append(value >= brightness_cutoff and chroma <= 60)
+
+        visited = [False] * len(candidate_mask)
+        boxes = []
+        candidate_pixels = 0
+
+        for start_index, is_candidate in enumerate(candidate_mask):
+            if not is_candidate or visited[start_index]:
+                continue
+
+            stack = [start_index]
+            visited[start_index] = True
+            area = 0
+            min_x = width
+            min_y = height
+            max_x = -1
+            max_y = -1
+
+            while stack:
+                index = stack.pop()
+                area += 1
+                y, x = divmod(index, width)
+                if x < min_x:
+                    min_x = x
+                if y < min_y:
+                    min_y = y
+                if x > max_x:
+                    max_x = x
+                if y > max_y:
+                    max_y = y
+
+                for next_y in (y - 1, y, y + 1):
+                    if next_y < 0 or next_y >= height:
+                        continue
+                    row_offset = next_y * width
+                    for next_x in (x - 1, x, x + 1):
+                        if next_x < 0 or next_x >= width or (next_x == x and next_y == y):
+                            continue
+                        next_index = row_offset + next_x
+                        if candidate_mask[next_index] and not visited[next_index]:
+                            visited[next_index] = True
+                            stack.append(next_index)
+
+            if area >= min_component_area:
+                candidate_pixels += area
+                boxes.append((min_x, min_y, max_x + 1, max_y + 1))
+
+        foreground_pixels = len(foreground_values)
+        coverage = candidate_pixels / foreground_pixels if foreground_pixels else 0.0
+
+        if candidate_pixels == 0:
+            suggestion = LABELS[0]
+        elif coverage < 0.005:
+            suggestion = LABELS[1]
+        elif coverage < 0.025:
+            suggestion = LABELS[2]
+        else:
+            suggestion = LABELS[3]
+
+        summary = f"Auto-check: {suggestion} | candidate coverage {coverage:.2%} | clusters {len(boxes)}"
+        return {"summary": summary, "boxes": boxes, "coverage": coverage, "suggestion": suggestion}
+
+    def _otsu_threshold(self, histogram):
+        total = sum(histogram)
+        if total == 0:
+            return 0
+
+        sum_total = sum(index * count for index, count in enumerate(histogram))
+        sum_background = 0
+        weight_background = 0
+        best_threshold = 0
+        best_variance = -1.0
+
+        for index, count in enumerate(histogram):
+            weight_background += count
+            if weight_background == 0:
+                continue
+
+            weight_foreground = total - weight_background
+            if weight_foreground == 0:
+                break
+
+            sum_background += index * count
+            mean_background = sum_background / weight_background
+            mean_foreground = (sum_total - sum_background) / weight_foreground
+            variance = weight_background * weight_foreground * (mean_background - mean_foreground) ** 2
+            if variance > best_variance:
+                best_variance = variance
+                best_threshold = index
+
+        return best_threshold
 
     def _label_current(self, label):
         if not self.items:
